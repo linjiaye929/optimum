@@ -15,6 +15,7 @@
 import operator
 import unittest
 
+import pytest
 import torch
 from parameterized import parameterized
 from transformers import AutoModel, AutoModelForImageClassification, AutoTokenizer, BertModel
@@ -329,6 +330,64 @@ def test_fuse_conv2d_batchnorm2d():
 
     num_batchnorm2d = sum(1 if isinstance(mod, torch.nn.BatchNorm2d) else 0 for mod in transformed_model.modules())
     assert num_batchnorm2d == 0, "there should be no BatchNorm2d left in the model after the transformation"
+
+
+@pytest.mark.parametrize("conv_bias", [False, True])
+@pytest.mark.parametrize("bn_affine", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fuse_conv2d_batchnorm2d_preserves_output(conv_bias, bn_affine, dtype):
+    conv = torch.nn.Conv2d(2, 3, kernel_size=1, bias=conv_bias, dtype=dtype)
+    bn = torch.nn.BatchNorm2d(3, eps=0.01, affine=bn_affine, dtype=dtype)
+    with torch.no_grad():
+        conv.weight.copy_(torch.arange(6, dtype=dtype).reshape(3, 2, 1, 1) / 10)
+        if conv_bias:
+            conv.bias.copy_(torch.tensor([0.5, -1.0, 2.0], dtype=dtype))
+        bn.running_mean.copy_(torch.tensor([0.1, -0.3, 0.7], dtype=dtype))
+        bn.running_var.copy_(torch.tensor([0.25, 4.0, 9.0], dtype=dtype))
+        if bn_affine:
+            bn.weight.copy_(torch.tensor([2.0, 0.5, -1.0], dtype=dtype))
+            bn.bias.copy_(torch.tensor([0.3, -0.2, 1.0], dtype=dtype))
+
+    model = torch.nn.Sequential(conv, bn).eval()
+    inputs = torch.arange(16, dtype=dtype).reshape(2, 2, 2, 2) / 10
+    with torch.no_grad():
+        expected = model(inputs)
+        traced = torch.fx.symbolic_trace(model)
+        transformed = FuseBatchNorm2dInConv2d()(traced)
+        actual = transformed(inputs)
+
+    assert transformed is traced
+    assert transformed.get_submodule("0") is conv
+    assert isinstance(conv.weight, torch.nn.Parameter)
+    assert isinstance(conv.bias, torch.nn.Parameter)
+    assert conv.weight.dtype == conv.bias.dtype == dtype
+    assert not any(isinstance(module, torch.nn.BatchNorm2d) for module in transformed.modules())
+    torch.testing.assert_close(actual, expected)
+
+
+def test_fuse_conv2d_batchnorm2d_preserves_branch():
+    class BranchedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(2, 3, kernel_size=1)
+            self.bn = torch.nn.BatchNorm2d(3)
+
+        def forward(self, inputs):
+            outputs = self.conv(inputs)
+            return outputs, self.bn(outputs)
+
+    model = BranchedModel().eval()
+    inputs = torch.arange(16, dtype=torch.float32).reshape(2, 2, 2, 2) / 10
+    with torch.no_grad():
+        expected = model(inputs)
+        traced = torch.fx.symbolic_trace(model)
+        transformed = FuseBatchNorm2dInConv2d()(traced)
+        actual = transformed(inputs)
+
+    assert transformed is traced
+    assert transformed.conv is model.conv
+    assert transformed.bn is model.bn
+    torch.testing.assert_close(actual, expected)
 
 
 def test_fuse_linear_batchnorm1d():

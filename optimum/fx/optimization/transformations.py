@@ -23,6 +23,7 @@ from typing import List
 
 import torch
 from torch.fx import GraphModule, Node, Proxy
+from torch.nn.utils.fusion import fuse_conv_bn_weights
 from transformers.file_utils import add_end_docstrings
 
 
@@ -541,19 +542,15 @@ class FuseBatchNorm2dInConv2d(Transformation):
         return graph_module
 
     def fuse(self, conv2d: torch.nn.Conv2d, bn2d: torch.nn.BatchNorm2d):
-        # handle the case where there is no bias in the conv or the batchnorm has no learnable parameters
-        conv_b = conv2d.bias if conv2d.bias is not None else torch.zeros_like(bn2d.running_mean)
-        bn_w = bn2d.weight if bn2d.weight is not None else torch.ones_like(bn2d.running_mean)
-        bn_b = bn2d.bias if bn2d.bias is not None else torch.ones_like(bn2d.running_mean)
-
-        bn_var_rsqrt = torch.rsqrt(bn2d.running_var + bn2d.eps)
-
-        conv2d.weight = torch.nn.Parameter(
-            conv2d.weight * (bn_w * bn_var_rsqrt).reshape([-1] + [1] * (len(conv2d.weight.shape) - 1))
+        conv2d.weight, conv2d.bias = fuse_conv_bn_weights(
+            conv2d.weight,
+            conv2d.bias,
+            bn2d.running_mean,
+            bn2d.running_var,
+            bn2d.eps,
+            bn2d.weight,
+            bn2d.bias,
         )
-
-        conv2d.bias = torch.nn.Parameter(conv_b - bn2d.running_mean * bn_var_rsqrt * bn_w + bn_b)
-
         return conv2d
 
 
